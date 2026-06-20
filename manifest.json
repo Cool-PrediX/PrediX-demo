@@ -1,0 +1,57 @@
+{
+  "manifest_version": 3,
+  "name": "PrediX - Polymarket Smart Recommendations",
+  "version": "1.0.0",
+  "description": "Real-time Polymarket prediction market recommendations for Twitter (X)",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "alarms",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://predix-api.tsuyu.love/*",
+    "https://gamma-api.polymarket.com/*",
+    "https://data-api.polymarket.com/*",
+    "https://clob.polymarket.com/*",
+    "https://pbs.twimg.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {},
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; object-src 'self'"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ],
+      "js": [
+        "main.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "injected.js",
+        "models/**",
+        "lib/**",
+        "*.js"
+      ],
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ]
+    }
+  ]
+}
