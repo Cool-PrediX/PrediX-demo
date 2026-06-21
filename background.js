@@ -1,6 +1,6 @@
 // ============================================================
 // src/background.js
-// MV3 Service Worker — config hub + proxy + cache + LLM polling
+// MV3 Service Worker — 配置中心 + 代理 + 缓存 + LLM 轮询
 // ============================================================
 
 const CONFIG = {
@@ -38,7 +38,7 @@ const ALLOWED_HOSTS = (() => {
 })();
 
 /* ================================================================
-   i18n normalization
+   i18n 归一化
    ================================================================ */
 
 function normalizeResult(data) {
@@ -46,10 +46,8 @@ function normalizeResult(data) {
     if (!result) continue;
     result.title = result.i18n_title || result.title;
     result.question = result.i18n_question || result.question;
-    result.description = result.i18n_description || result.description;
     delete result.i18n_title;
     delete result.i18n_question;
-    delete result.i18n_description;
     for (const market of result.markets || []) {
       if (!market) continue;
       if (market.i18n_question) {
@@ -62,7 +60,7 @@ function normalizeResult(data) {
 }
 
 /* ================================================================
-   Match cache (memory + storage.local)
+   Match 缓存（内存 + storage.local）
    ================================================================ */
 
 const cache = new Map();
@@ -88,12 +86,12 @@ async function createOffscreen() {
         justification: "Host ML models for tweet preprocessing",
       });
     }
-  } catch (err) { /* Silent degrade when offscreen unavailable */ }
+  } catch (err) { /* offscreen 不可用时静默降级 */ }
 }
 createOffscreen();
 
 chrome.runtime.onConnect.addListener((port) => {
-  // Maintain offscreen keepalive port to prevent Chrome from destroying offscreen document
+  // 保持 offscreen keepalive 端口，防止 Chrome 销毁 offscreen 文档
   if (port.name === "offscreen-keepalive") return;
 });
 
@@ -106,7 +104,7 @@ function isAllowed(url) {
   }
 }
 
-/* ---------- SHA-256 (sync) ---------- */
+/* ---------- SHA-256（同步） ---------- */
 
 function sha256Sync(input) {
   let hash = 0;
@@ -118,7 +116,7 @@ function sha256Sync(input) {
   return hash.toString(36);
 }
 
-/* ---------- Request body dedup ---------- */
+/* ---------- 请求体级别去重 ---------- */
 
 const matchInFlight = new Map();
 
@@ -133,7 +131,13 @@ function cacheBodySet(bodyStr, data) {
 
 function cacheGetByBody(bodyStr) {
   const key = sha256Sync(bodyStr);
-  return bodyCache.get(key)?.data ?? null;
+  const entry = bodyCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > CONFIG.CACHE_TTL_MS) {
+    bodyCache.delete(key);
+    return null;
+  }
+  return entry.data;
 }
 
 let bodyPersistTimer = null;
@@ -148,7 +152,7 @@ function scheduleBodyPersist() {
   }, 3000);
 }
 
-/* ---------- tweet_hash level cache ---------- */
+/* ---------- tweet_hash 级别缓存 ---------- */
 
 function cacheGet(tweetHash) {
   const entry = cache.get(tweetHash);
@@ -202,7 +206,7 @@ function persistCache() {
 }
 
 /* ================================================================
-   LLM polling — driven by chrome.alarms
+   LLM 轮询 — chrome.alarms 驱动
    ================================================================ */
 
 const pendingPolls = new Map();
@@ -264,18 +268,25 @@ async function executeBatchPoll() {
 
 function pushIntermediateResult(tweetHash, pollResult, tabId) {
   cacheUpdate(tweetHash, (c) => {
-    const rawResults = pollResult.initial_results || pollResult.results || [];
-    // Do not threshold-filter here — empty results cause the frontend to delete buttons then immediately re-inject, triggering page jitter
-    c.results = rawResults
-      .map((r) => ({
-        id: r.id || r.event_id,
-        title: r.i18n_title || r.title || r.question,
-        question: r.i18n_question || r.question,
-        rank: r.rank != null ? r.rank : (r.score || 0),
-        description: r.i18n_description || r.description,
-        category: r.category,
-        markets: r.markets || [],
-      }));
+    const rawResults = pollResult._enriched_initial || pollResult.initial_results || pollResult.results || [];
+    const existingMap = new Map();
+    for (const orig of c.results || []) existingMap.set(orig.id, orig);
+
+    c.results = rawResults.map((r) => {
+      const id = r.id || r.event_id;
+      const existing = existingMap.get(id);
+      return {
+        id:          id || existing?.id,
+        title:       r.i18n_title || r.title || r.question || existing?.title || "",
+        question:    r.i18n_question || r.question || existing?.question || "",
+        rank:        r.rank != null ? r.rank : (r.score ?? existing?.rank ?? 0),
+        category:    r.category ?? existing?.category,
+        markets:     (r.markets?.length ? r.markets : existing?.markets) || [],
+        description: existing?.description || "",
+        descriptionOriginal: existing?.descriptionOriginal || r.description || "",
+        i18n_title:  r.i18n_title || existing?.i18n_title,
+      };
+    });
     c.is_optimizing = true;
     c.enriched_level = pollResult.enriched_level || 1;
   });
@@ -286,7 +297,7 @@ function pushIntermediateResult(tweetHash, pollResult, tabId) {
       type: "LLM_RESULT_READY",
       hash: tweetHash,
       results: updated.results,
-      is_optimizing: updated.is_optimizing || false,
+      is_optimizing: true,
     }).catch(() => {});
   }
 }
@@ -295,17 +306,16 @@ function onPollCompleted(tweetHash, pollResult, tabId) {
   cacheUpdate(tweetHash, (c) => {
     c.is_optimizing = false;
     const threshold = CONFIG.MATCH_THRESHOLD;
+    const llmResults = pollResult.results || [];
     c.results = (c.results || [])
       .map((orig) => {
-        const llm = (pollResult.results || []).find(
-          (r) => r.event_id === orig.id || r.market_id === orig.id,
-        );
+        const llm = llmResults.find((r) => r.event_id === orig.id);
         if (!llm || llm.score < threshold) return null;
         return {
           ...orig,
-          title: llm.i18n_title || llm.question,
-          question: llm.i18n_question || llm.question,
-          rank: llm.score,
+          title:    llm.i18n_question || llm.question || orig.title,
+          question: llm.i18n_question || llm.question || orig.question,
+          rank:     llm.score,
         };
       })
       .filter(Boolean);
@@ -325,10 +335,11 @@ function onPollCompleted(tweetHash, pollResult, tabId) {
 }
 
 /* ================================================================
-   Request handling
+   请求处理
    ================================================================ */
 
 async function handleMatchRequest(url, options, tabId, sendResponse) {
+  try {
   const bodyStr = options.body || "{}";
   const body = JSON.parse(bodyStr);
   const tweets = body.tweets || [];
@@ -374,7 +385,6 @@ async function handleMatchRequest(url, options, tabId, sendResponse) {
         }
       }
 
-      // Only cache full response when there are effective results; empty result dedup relies on matchInFlight
       if (hasResults) cacheBodySet(bodyStr, data);
       return { success: true, status: res.status, body: text };
     }
@@ -390,24 +400,97 @@ async function handleMatchRequest(url, options, tabId, sendResponse) {
   } finally {
     matchInFlight.delete(bodyKey);
   }
+  } catch (err) {
+    sendResponse({ success: false, error: err.message || "Invalid match request" });
+  }
+}
+
+/* ---------- Proxy cache (in-memory, TTL-based) ---------- */
+
+const proxyCache = new Map();
+const proxyInFlight = new Map();
+
+function getCacheTtl(url) {
+  if (url.includes("/markets/")) return 10_000;
+  if (url.includes("/events?")) return 120_000;
+  if (url.includes("/book?")) return 5_000;
+  if (url.includes("/prices-history")) return 300_000;
+  if (url.includes("/positions")) return 0;
+  if (url.includes("/market-positions")) return 0;
+  return 10_000;
+}
+
+function proxyCacheGet(url) {
+  const entry = proxyCache.get(url);
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) { proxyCache.delete(url); return null; }
+  return entry.body;
+}
+
+function proxyCacheSet(url, body) {
+  const ttl = getCacheTtl(url);
+  proxyCache.set(url, { body, expiresAt: Date.now() + ttl });
+  if (proxyCache.size > 200) {
+    const now = Date.now();
+    for (const [k, v] of proxyCache) { if (now >= v.expiresAt) proxyCache.delete(k); }
+    if (proxyCache.size > 200) {
+      const sorted = [...proxyCache.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+      while (proxyCache.size > 200 && sorted.length > 0) {
+        const [k] = sorted.shift();
+        proxyCache.delete(k);
+      }
+    }
+  }
 }
 
 async function proxyRequest(url, options, sendResponse) {
-  try {
-    const res = await fetch(url, {
-      method: options?.method || "GET",
-      headers: options?.headers || {},
-      body: options?.body,
-    });
-    const text = await res.text();
-    sendResponse({ success: res.ok, status: res.status, body: text });
-  } catch (err) {
-    sendResponse({ success: false, error: err.message });
+  const method = options?.method || "GET";
+  const isCacheable = method === "GET" && !options?.body;
+
+  if (isCacheable) {
+    const cached = proxyCacheGet(url);
+    if (cached) { sendResponse({ success: true, status: 200, body: cached }); return; }
+    if (proxyInFlight.has(url)) {
+      try { const res = await proxyInFlight.get(url); sendResponse(res); } catch (err) { sendResponse({ success: false, error: err.message }); }
+      return;
+    }
+  }
+
+  const promise = (async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12_000);
+      try {
+        const res = await fetch(url, {
+          method, headers: options?.headers || {}, body: options?.body,
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        const text = await res.text();
+        const result = { success: res.ok, status: res.status, body: text };
+        if (res.ok && isCacheable) proxyCacheSet(url, text);
+        return result;
+      } catch (err) {
+        clearTimeout(timer);
+        throw err;
+      }
+    } catch (err) {
+      console.error("[proxyRequest] fetch failed:", url, err?.message || err);
+      throw err;
+    }
+  })();
+
+  if (isCacheable) {
+    proxyInFlight.set(url, promise);
+    try { const res = await promise; sendResponse(res); } catch (err) { console.error("[proxyRequest] cached path failed:", url, err?.message || err); sendResponse({ success: false, error: err.message }); }
+    finally { proxyInFlight.delete(url); }
+  } else {
+    try { const res = await promise; sendResponse(res); } catch (err) { console.error("[proxyRequest] non-cached path failed:", url, err?.message || err); sendResponse({ success: false, error: err.message }); }
   }
 }
 
 /* ================================================================
-   SW restart recovery + heartbeat keepalive
+   SW 重启恢复 + 心跳保活
    ================================================================ */
 
 (function recoverPolls() {
@@ -419,18 +502,18 @@ async function proxyRequest(url, options, sendResponse) {
 chrome.alarms.create("heartbeat", { periodInMinutes: 0.33 });
 
 /* ================================================================
-   Extension icon click → toggle sidebar
+   扩展图标点击 → 切换侧边栏
    ================================================================ */
 
 chrome.action.onClicked.addListener((tab) => {
   if (!tab.id) return;
   chrome.tabs.sendMessage(tab.id, { type: "TOGGLE_SIDEBAR" }).catch(() => {
-    /* Non-Twitter pages have no content script, silently ignore */
+    /* 非 Twitter 页面无 content script，静默忽略 */
   });
 });
 
 /* ================================================================
-   Message routing
+   消息路由
    ================================================================ */
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -501,9 +584,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     case "GET_TOKENS": {
-      // Forward to offscreen document (ML Worker); silent degrade when not ready
+      // 转发到 offscreen document（ML Worker）；未就绪时静默降级
       try {
+        let responded = false;
+        const timer = setTimeout(() => {
+          if (!responded) { responded = true; sendResponse(null); }
+        }, 15_000);
         chrome.runtime.sendMessage(message, (response) => {
+          if (responded) return;
+          responded = true;
+          clearTimeout(timer);
           if (chrome.runtime.lastError) { sendResponse(null); return; }
           sendResponse(response);
         });
